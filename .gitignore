@@ -1,0 +1,11 @@
+*.csv
+*.jpg
+*.jpeg
+*.webp
+*.xml
+*.log
+*.bak
+*.txt
+
+/sfcc-images/images
+/node_modules
