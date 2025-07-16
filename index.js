@@ -48,6 +48,7 @@ const viewLabelMap = {
 
 const ignoredFolders = ['spins', 'spin', 'swatch'];
 let xmlData = [];
+let activeCatalogBase = '';
 
 // Load style filters
 const stylesFiles = fs.readdirSync(stylesDir).filter(f => f.endsWith('_styles.txt'));
@@ -65,6 +66,7 @@ fs.readdirSync(catalogsDir).filter(f => f.endsWith('.xml')).forEach(f => {
   const parser = new DOMParser();
   const doc = parser.parseFromString(data, 'text/xml');
   const baseName = f.replace('_catalog.xml', '').replace('.xml', '');
+  activeCatalogBase = baseName; // Track active file base name
   const allowedStyles = stylesMap.get(baseName);
   if (!allowedStyles) return console.warn(`⚠️  No styles list found for catalog ${f}`);
 
@@ -150,8 +152,55 @@ async function extractImageView(productId, imagePath) {
 }
 
 function exportViewCSV() {
-  // This still writes CSV using product.views
-  // You can update this if needed like in the previous logic
+  const outputPath = path.join(__dirname, 'script-image-list-output', `${activeCatalogBase}_catalog-image-inventory-export.csv`);
+  const header = ['productId', 'nonGrayImageFileNames', 'grayImageFileNames'];
+  const csvContent = [header.join(',')];
+
+  for (const product of productImagesAvailable) {
+    const { productId, views } = product;
+    const gray = [];
+    const nonGray = [];
+
+    for (const [view, imagePath] of views.entries()) {
+      const filename = `${productId}_${view}.jpg`;
+      if (view.startsWith('gray_')) {
+        gray.push({ filename, view });
+      } else {
+        nonGray.push({ filename, view });
+      }
+    }
+
+    const defaultPreferredOrder = [
+      'main', 'lifestyle', 'outsole', 'profile', 'front', 'back', 'instep_profile', 'birdseye'
+    ];
+    const grayPreferredOrder = [
+      'profile', 'lifestyle', 'main', 'instep_profile', 'doubleheel', 'doublequarter', 'outsole'
+    ];
+
+    for (const key of ['gray', 'nonGray']) {
+      const preferredOrder = key === 'gray' ? grayPreferredOrder : defaultPreferredOrder;
+      const list = key === 'gray' ? gray : nonGray;
+
+      list.sort((a, b) => {
+        const viewA = a.view.replace(/^(gray_|default_|white_)/, '').replace(/_\d+x\d+$/, '');
+        const viewB = b.view.replace(/^(gray_|default_|white_)/, '').replace(/_\d+x\d+$/, '');
+        const indexA = preferredOrder.indexOf(viewA);
+        const indexB = preferredOrder.indexOf(viewB);
+        if (indexA === -1 && indexB === -1) return a.view.localeCompare(b.view);
+        if (indexA === -1) return 1;
+        if (indexB === -1) return -1;
+        return indexA - indexB;
+      });
+    }
+
+    const nonGrayList = nonGray.map(x => x.filename).join(', ');
+    const grayList = gray.map(x => x.filename).join(', ');
+    const row = `"${productId}","${nonGrayList}","${grayList}"`;
+    csvContent.push(row);
+  }
+
+  fs.writeFileSync(outputPath, csvContent.join('\n'), 'utf8');
+  console.log(`✅ CSV exported to: ${outputPath}`);
 }
 
 function copyImagesToOutput() {
@@ -173,8 +222,70 @@ function copyImagesToOutput() {
 }
 
 function generateMatrixifyCSV() {
-  // Existing function with sanitizeText applied
+  const styleMapFile = path.join(shopifyStylesDir, `${activeCatalogBase}_styles.csv`);
+  if (!fs.existsSync(styleMapFile)) {
+    console.error('❌ Missing Shopify style map CSV:', styleMapFile);
+    return;
+  }
+
+  const styleMapContent = fs.readFileSync(styleMapFile, 'utf-8');
+  const lines = styleMapContent.split(/\r?\n/).filter(line => line.trim());
+  const styleMap = new Map();
+
+  for (let i = 1; i < lines.length; i++) {
+    const [id, title, style] = lines[i].split(',').map(s => s.trim());
+    if (style) styleMap.set(style, { id, title });
+  }
+
+  const inventoryFile = path.join(__dirname, 'script-image-list-output', `${activeCatalogBase}_catalog-image-inventory-export.csv`);
+
+  if (!fs.existsSync(inventoryFile)) {
+    console.error('❌ Missing image inventory CSV:', inventoryFile);
+    return;
+  }
+  const rows = fs.readFileSync(inventoryFile, 'utf-8').split(/\r?\n/).slice(1); // skip header
+  const output = [
+    ['ID', 'Image Type', 'Image Src', 'Image Command', 'Image Position', 'Image Width', 'Image Height', 'Image Alt Text', 'Style']
+  ];
+
+  for (const row of rows) {
+    if (!row.trim()) continue;
+    const [style, nonGrayListRaw, grayListRaw] = row.split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/).map(s => s.replace(/^"|"$/g, '').trim());
+    const productInfo = styleMap.get(style);
+    if (!productInfo) continue;
+    const imageList = grayListRaw ? grayListRaw.split(',') : nonGrayListRaw.split(',');
+    let position = 1;
+    for (const image of imageList) {
+      const trimmed = image.trim();
+      if (!trimmed) continue;
+      const parts = trimmed.split('_');
+      const dimPart = parts[parts.length - 1].replace('.jpg', '');
+      const view = parts[parts.length - 2];
+      const [width, height] = dimPart.includes('x') ? dimPart.split('x') : ['', ''];
+      const cleanView = sanitizeText(view);
+      const viewText = cleanView === 'default' ? '' : ` - ${cleanView}`;
+      const cleanTitle = sanitizeText(productInfo.title);
+      const altText = `${cleanTitle}${viewText}`;
+      output.push([
+        productInfo.id,
+        'IMAGE',
+        trimmed,
+        'REPLACE',
+        position++,
+        width,
+        height,
+        altText,
+        position === 2 ? style : '' // only show style on first row
+      ]);
+    }
+  }
+
+  const outPath = path.join(matrixifyDir, `${activeCatalogBase}_matrixify_image_upload.csv`);
+  const csvText = output.map(r => r.map(f => `"${f}"`).join(',')).join('\n');
+  fs.writeFileSync(outPath, csvText, 'utf-8');
+  console.log(`✅ Matrixify CSV written to: ${outPath}`);
 }
+
 
 processProductViews().then(() => {
   exportViewCSV();
